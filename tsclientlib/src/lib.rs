@@ -236,6 +236,20 @@ pub enum StreamItem {
 	/// variant. Other messages handled by tsclientlib, e.g. for filetransfer are also not included
 	/// in these events.
 	MessageEvent(InMessage),
+	/// An incoming command that is not in the message declarations, passed
+	/// through unparsed instead of being dropped.
+	///
+	/// TeamSpeak 6 added commands that this library does not know, notably the
+	/// `stream` family (`notifystreamsignaling` and friends) used to carry
+	/// Stream/Call SDP and ICE payloads between peers. Parsing them properly
+	/// would mean declaring every one of them; consumers that only need to
+	/// relay the payload can read `content` directly.
+	UnknownCommand {
+		/// The command name, e.g. `notifystreamsignaling`.
+		name: String,
+		/// The full command line as received, still TS-escaped.
+		content: String,
+	},
 	/// Received an audio packet.
 	///
 	/// Audio packets can be handled by the [`AudioHandler`](audio::AudioHandler), which builds a
@@ -1551,6 +1565,15 @@ impl ConnectedConnection {
 		let msg = match InMessage::new(cmd.data().packet().header(), cmd.data().packet().content())
 		{
 			Ok(r) => r,
+			Err(ts_bookkeeping::messages::ParseError::UnknownCommand(name)) => {
+				// Dropping these made TS6's stream signaling invisible to
+				// consumers, since none of those commands are declared. Hand
+				// the raw line up instead and let the caller decide.
+				let content =
+					String::from_utf8_lossy(cmd.data().packet().content()).into_owned();
+				stream_items.push_back(Ok(StreamItem::UnknownCommand { name, content }));
+				return None;
+			}
 			Err(error) => {
 				warn!(%error, "Failed to parse message");
 				return None;

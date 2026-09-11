@@ -58,6 +58,14 @@ pub enum SyncStreamItem {
 	/// variant. Other messages handled by tsclientlib, e.g. for filetransfer are also not included
 	/// in these events.
 	MessageEvent(InMessage),
+	/// An incoming command that is not in the message declarations, passed
+	/// through unparsed. See [`StreamItem::UnknownCommand`](super::StreamItem::UnknownCommand).
+	UnknownCommand {
+		/// The command name, e.g. `notifystreamsignaling`.
+		name: String,
+		/// The full command line as received, still TS-escaped.
+		content: String,
+	},
 	/// Received an audio packet.
 	///
 	/// Audio packets can be handled by the [`AudioHandler`](crate::audio::AudioHandler), which
@@ -234,6 +242,9 @@ impl Stream for SyncConnection {
 							SyncStreamItem::BookEvents(i)
 						}
 						StreamItem::MessageEvent(i) => SyncStreamItem::MessageEvent(i),
+						StreamItem::UnknownCommand { name, content } => {
+							SyncStreamItem::UnknownCommand { name, content }
+						}
 						#[cfg(feature = "audio")]
 						StreamItem::Audio(i) => SyncStreamItem::Audio(i),
 						StreamItem::IdentityLevelIncreasing(i) => {
