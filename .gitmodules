@@ -1,4 +1,4 @@
 [submodule "utils/tsproto-structs/declarations"]
 	path = utils/tsproto-structs/declarations
-	url = https://github.com/GreenTeaSpeak/tsdeclarations.git
+	url = https://github.com/Moepchi/tsdeclarations.git
 	branch = webspeak3
