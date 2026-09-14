@@ -126,8 +126,8 @@ pub fn resolve(address: String) -> impl Stream<Item = Result<SocketAddr>> {
 			stream::once(future::err(Error::InvalidNickname)).right_stream()
 		};
 
-		// GreenTeaSpeak order: `_gts._udp` before `_ts3._udp`, and also query the
-		// registrable root (`ts.example.com` → also `example.com`).
+		// GreenTeaSpeak order: `_gts._udp` before `_ts3._udp`, exact host only
+		// (no apex fallback - see srv_lookup_hosts / issue #9).
 		let srv_hosts = srv_lookup_hosts(&addr);
 		let nick = nick.chain(resolve_srv_records(srv_hosts.clone(), DNS_PREFIX_UDP_GTS));
 		let nick = nick.chain(resolve_srv_records(srv_hosts, DNS_PREFIX_UDP));
@@ -190,22 +190,16 @@ pub fn resolve(address: String) -> impl Stream<Item = Result<SocketAddr>> {
 		.right_stream()
 }
 
-/// Hosts to query for `_gts`/`_ts3` SRV: FQDN first, then the two-label root.
+/// Hosts to query for `_gts`/`_ts3` SRV: the exact hostname only.
+///
+/// Used to also fall back to the two-label root (`ts6.example.com` → also
+/// `example.com`), but that hijacks a subdomain which has its own A record onto
+/// the apex SRV of a *different* server: e.g. `ts6.host` (A → the TS6 box) got
+/// routed to `_ts3._udp.host` (→ the TS3 box) before its own A record was tried.
+/// The official TS client does SRV on the exact host only; root-walking is
+/// TSDNS's job (see the `_tsdns._tcp` step above). See GitHub issue #9.
 fn srv_lookup_hosts(host: &str) -> Vec<String> {
-	let host = host.trim_end_matches('.').to_string();
-	if host.is_empty() || host == "localhost" {
-		return vec![host];
-	}
-	let parts: Vec<&str> = host.split('.').filter(|p| !p.is_empty()).collect();
-	if parts.len() <= 2 {
-		return vec![host];
-	}
-	let root = parts[parts.len() - 2..].join(".");
-	if root == host {
-		vec![host]
-	} else {
-		vec![host, root]
-	}
+	vec![host.trim_end_matches('.').to_string()]
 }
 
 /// Resolve SRV for each host under `service` (e.g. `_gts._udp.`).
@@ -518,13 +512,15 @@ mod test {
 	}
 
 	#[test]
-	fn srv_lookup_hosts_full_then_root() {
+	fn srv_lookup_hosts_exact_only() {
+		// Exact host only - no apex fallback, so a subdomain with its own record
+		// is never hijacked onto a different server's apex SRV (issue #9).
 		assert_eq!(
-			srv_lookup_hosts("ts.greenteaspeak.de"),
-			vec!["ts.greenteaspeak.de".to_string(), "greenteaspeak.de".to_string()]
+			srv_lookup_hosts("ts6.rush-zone.com"),
+			vec!["ts6.rush-zone.com".to_string()]
 		);
 		assert_eq!(
-			srv_lookup_hosts("greenteaspeak.de"),
+			srv_lookup_hosts("greenteaspeak.de."),
 			vec!["greenteaspeak.de".to_string()]
 		);
 		assert_eq!(srv_lookup_hosts("localhost"), vec!["localhost".to_string()]);
