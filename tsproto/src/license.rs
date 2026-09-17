@@ -442,6 +442,9 @@ impl License {
 	}
 
 	pub fn get_public_key(&self, data: &[u8]) -> Result<EdwardsPoint> {
+		if data.len() < 33 {
+			return Err(Error::TooShort(data.len(), "license block too short for a public key"));
+		}
 		let k = EccKeyPubEd25519::from_bytes(data[1..33].try_into().unwrap());
 		k.0.decompress().ok_or(Error::InvalidPublicKey)
 	}

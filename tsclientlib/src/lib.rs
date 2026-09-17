@@ -1490,9 +1490,33 @@ const DEFAULT_FILETRANSFER_PORT: u16 = 30033;
 /// TeaSpeak / GreenTeaSpeak default FT TCP port when notify port is missing.
 const TEASPEAK_DEFAULT_FILETRANSFER_PORT: u16 = 30303;
 
+/// True for loopback / private / link-local addresses - the ranges a server
+/// has no legitimate reason to redirect a *different* server's file transfer
+/// to.
+fn is_internal_addr(ip: &IpAddr) -> bool {
+	match ip {
+		IpAddr::V4(v4) => v4.is_loopback() || v4.is_private() || v4.is_link_local(),
+		IpAddr::V6(v6) => {
+			v6.is_loopback()
+				// fc00::/7 (unique local)
+				|| (v6.segments()[0] & 0xfe00) == 0xfc00
+				// fe80::/10 (link-local)
+				|| (v6.segments()[0] & 0xffc0) == 0xfe80
+		}
+	}
+}
+
 /// Resolve the TCP endpoint for a file transfer.
 ///
 /// - IP: TeaSpeak often reports `ip=0.0.0.0` (or omits it) → use the voice peer IP.
+///   We run as a server-side process (the browser talks to us, we talk to the
+///   TS3/TeaSpeak server the user picked), so trusting an arbitrary reported IP
+///   outright would let *any* server the user points us at redirect our file
+///   transfer connection into our own host's internal network (SSRF). If the
+///   server we're actually voice-connected to is itself internal (a
+///   self-hosted LAN setup), an internal reported IP is expected and allowed;
+///   otherwise an internal reported IP is ignored in favor of the voice peer's
+///   own IP, exactly like the "not reported at all" case above.
 /// - Port: prefer `notifystart{down,up}load` `port` (usually 30033 / 30303). If it is
 ///   0 or equals the voice UDP port (almost never a valid FT TCP port), use
 ///   `fallback_port` (last known FT port, else server-type default).
@@ -1501,7 +1525,11 @@ fn resolve_filetransfer_addr(
 	fallback_port: u16,
 ) -> SocketAddr {
 	let ip = match reported_ip {
-		Some(ip) if !ip.is_unspecified() => ip,
+		Some(ip)
+			if !ip.is_unspecified() && (!is_internal_addr(&ip) || is_internal_addr(&voice_peer.ip())) =>
+		{
+			ip
+		}
 		_ => voice_peer.ip(),
 	};
 	let port = if reported_port == 0 || reported_port == voice_peer.port() {
