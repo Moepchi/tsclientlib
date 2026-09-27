@@ -4,6 +4,8 @@
 
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::str;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use futures::prelude::*;
 use hickory_net::proto::rr::RData;
@@ -60,6 +62,8 @@ pub enum Error {
 	TsdnsAddressNotFound,
 	#[error("Failed to parse tsdns response: {0}")]
 	TsdnsParseResponse(#[source] std::str::Utf8Error),
+	#[error("All resolution methods failed: {0}")]
+	AllAttemptsFailed(String),
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -173,21 +177,50 @@ pub fn resolve(address: String) -> impl Stream<Item = Result<SocketAddr>> {
 	};
 
 	// TODO Move current span into stream
-	tokio_stream::StreamExt::timeout(res, Duration::from_secs(TIMEOUT_SECONDS))
+	let errors: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+	let succeeded = Arc::new(AtomicBool::new(false));
+	let errors2 = errors.clone();
+	let succeeded2 = succeeded.clone();
+
+	let timed = tokio_stream::StreamExt::timeout(res, Duration::from_secs(TIMEOUT_SECONDS))
 		.filter_map(move |r: std::result::Result<Result<SocketAddr>, _>| {
 			future::ready(match r {
 				// Timeout
-				Err(_) => None,
+				Err(_) => {
+					errors.lock().unwrap().push("Resolver step timed out".to_string());
+					None
+				}
 				// Error
 				Ok(Err(error)) => {
 					debug!(%error, "Resolver failed in one step");
+					errors.lock().unwrap().push(error.to_string());
 					None
 				}
 				// Success
-				Ok(Ok(r)) => Some(Ok(r)),
+				Ok(Ok(r)) => {
+					succeeded.store(true, Ordering::SeqCst);
+					Some(Ok(r))
+				}
 			})
-		})
-		.right_stream()
+		});
+
+	// Only surface the collected errors once every method has already been
+	// tried and none of them succeeded - keeps the "try everything" behavior
+	// intact while giving a diagnosable error instead of an empty list.
+	let summary = stream::once(async move {
+		if succeeded2.load(Ordering::SeqCst) {
+			return None;
+		}
+		let errors = errors2.lock().unwrap();
+		if errors.is_empty() {
+			None
+		} else {
+			Some(Err(Error::AllAttemptsFailed(errors.join("; "))))
+		}
+	})
+	.filter_map(future::ready);
+
+	timed.chain(summary).right_stream()
 }
 
 /// Hosts to query for `_gts`/`_ts3` SRV: the exact hostname only.
@@ -620,5 +653,21 @@ mod test {
 		create_logger();
 		let res: Vec<_> = resolve("loc".into()).map(|r| r.unwrap()).collect().await;
 		assert!(res.contains(&format!("127.0.0.1:{}", DEFAULT_PORT).parse().unwrap()));
+	}
+
+	#[tokio::test]
+	async fn resolve_nonexistent_host_reports_real_error() {
+		// RFC 2606 reserves .invalid for addresses that never resolve - every
+		// method (SRV, tsdns, plain DNS) fails here, so the stream must yield
+		// one AllAttemptsFailed error with the collected reasons instead of
+		// silently ending with nothing (the bug behind GitHub issue #11).
+		create_logger();
+		let res: Vec<_> =
+			resolve("definitely-does-not-exist.invalid".into()).collect().await;
+		assert_eq!(res.len(), 1, "expected exactly one aggregated error, got {res:?}");
+		match &res[0] {
+			Err(Error::AllAttemptsFailed(msg)) => assert!(!msg.is_empty()),
+			other => panic!("expected AllAttemptsFailed, got {other:?}"),
+		}
 	}
 }
