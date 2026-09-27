@@ -503,6 +503,13 @@ impl Connection {
 		let mut errors = Vec::new();
 		while let Some(addr) = resolved.next().await {
 			let addr = addr.map_err(|e| Error::ResolveAddress(Box::new(e)))?;
+			// Every resolution path (IP literal, nickname, SRV, TSDNS, plain DNS)
+			// ends here, so this one check covers them all - including DNS
+			// rebinding, since we connect to exactly the address we checked.
+			if !resolver::is_allowed_target(&addr.ip()) {
+				errors.push(Error::ResolveAddress(Box::new(resolver::Error::BlockedTarget(addr.ip()))));
+				continue;
+			}
 			match Self::connect_to(&options, addr).await {
 				Ok(res) => return Ok(res),
 				Err(e @ Error::IdentityLevel(_)) | Err(e @ Error::ConnectTs(_)) => {
@@ -1490,22 +1497,6 @@ const DEFAULT_FILETRANSFER_PORT: u16 = 30033;
 /// TeaSpeak / GreenTeaSpeak default FT TCP port when notify port is missing.
 const TEASPEAK_DEFAULT_FILETRANSFER_PORT: u16 = 30303;
 
-/// True for loopback / private / link-local addresses - the ranges a server
-/// has no legitimate reason to redirect a *different* server's file transfer
-/// to.
-fn is_internal_addr(ip: &IpAddr) -> bool {
-	match ip {
-		IpAddr::V4(v4) => v4.is_loopback() || v4.is_private() || v4.is_link_local(),
-		IpAddr::V6(v6) => {
-			v6.is_loopback()
-				// fc00::/7 (unique local)
-				|| (v6.segments()[0] & 0xfe00) == 0xfc00
-				// fe80::/10 (link-local)
-				|| (v6.segments()[0] & 0xffc0) == 0xfe80
-		}
-	}
-}
-
 /// Resolve the TCP endpoint for a file transfer.
 ///
 /// - IP: TeaSpeak often reports `ip=0.0.0.0` (or omits it) → use the voice peer IP.
@@ -1526,7 +1517,7 @@ fn resolve_filetransfer_addr(
 ) -> SocketAddr {
 	let ip = match reported_ip {
 		Some(ip)
-			if !ip.is_unspecified() && (!is_internal_addr(&ip) || is_internal_addr(&voice_peer.ip())) =>
+			if !ip.is_unspecified() && (resolver::is_public_addr(&ip) || !resolver::is_public_addr(&voice_peer.ip())) =>
 		{
 			ip
 		}

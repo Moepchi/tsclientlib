@@ -56,14 +56,70 @@ pub enum Error {
 	ResolveHost(#[source] tokio::io::Error),
 	#[error("Failed to get SRV record")]
 	SrvLookup(#[source] hickory_net::NetError),
-	#[error("tsdns did not return an ip address but {0:?}")]
-	TsdnsAddressInvalidResponse(String),
+	// Deliberately doesn't echo the response: it's whatever the (possibly
+	// attacker-chosen) TSDNS peer sent, and this message ends up in the UI.
+	#[error("tsdns did not return a valid ip address")]
+	TsdnsAddressInvalidResponse,
+	#[error("{0} is a private/internal address, which this gateway does not connect to")]
+	BlockedTarget(IpAddr),
 	#[error("tsdns server does not know the address")]
 	TsdnsAddressNotFound,
 	#[error("Failed to parse tsdns response: {0}")]
 	TsdnsParseResponse(#[source] std::str::Utf8Error),
 	#[error("All resolution methods failed: {0}")]
 	AllAttemptsFailed(String),
+}
+
+/// True for addresses on the public internet: not loopback, private, link-
+/// local, CGNAT, multicast, documentation or otherwise reserved. IPv4-mapped
+/// and NAT64/6to4-embedded IPv4 addresses are judged by the embedded address.
+pub fn is_public_addr(ip: &IpAddr) -> bool {
+	match ip {
+		IpAddr::V4(v4) => {
+			let [a, b, c, _] = v4.octets();
+			!(a == 0
+				|| v4.is_loopback()
+				|| v4.is_private()
+				|| v4.is_link_local()
+				|| v4.is_multicast()
+				|| v4.is_documentation()
+				|| a >= 240 // reserved + broadcast
+				|| (a == 100 && (b & 0xc0) == 64) // 100.64.0.0/10 CGNAT
+				|| (a == 192 && b == 0 && c == 0) // 192.0.0.0/24
+				|| (a == 198 && (b & 0xfe) == 18)) // 198.18.0.0/15 benchmarking
+		}
+		IpAddr::V6(v6) => {
+			if let Some(v4) = v6.to_ipv4_mapped() {
+				return is_public_addr(&IpAddr::V4(v4));
+			}
+			let s = v6.segments();
+			if s[0] == 0x64 && s[1] == 0xff9b && s[2..6] == [0, 0, 0, 0] {
+				let v4 = std::net::Ipv4Addr::from(((s[6] as u32) << 16) | s[7] as u32);
+				return is_public_addr(&IpAddr::V4(v4));
+			}
+			if s[0] == 0x2002 {
+				let v4 = std::net::Ipv4Addr::from(((s[1] as u32) << 16) | s[2] as u32);
+				return is_public_addr(&IpAddr::V4(v4));
+			}
+			!(v6.is_unspecified()
+				|| v6.is_loopback()
+				|| v6.is_multicast()
+				|| (s[0] & 0xfe00) == 0xfc00 // fc00::/7 unique local
+				|| (s[0] & 0xffc0) == 0xfe80 // fe80::/10 link-local
+				|| (s[0] & 0xffc0) == 0xfec0 // fec0::/10 site-local (deprecated)
+				|| (s[0] == 0x2001 && s[1] == 0x0db8) // documentation
+				|| s[0] == 0) // ::/16 incl. IPv4-compatible and other legacy forms
+		}
+	}
+}
+
+/// Whether we may open a connection to `ip`. We run server-side on behalf of
+/// arbitrary browser users, so by default only public addresses are fair game -
+/// anything else would let a user (or a server/DNS record they control) point
+/// us into the host's own network. Self-hosters whose TeamSpeak server lives
+/// on the same LAN opt in with `ALLOW_PRIVATE_TARGETS=1`.
+pub fn is_allowed_target(ip: &IpAddr) -> bool {
+	std::env::var("ALLOW_PRIVATE_TARGETS").is_ok_and(|v| v == "1") || is_public_addr(ip)
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -385,18 +441,31 @@ pub fn resolve_nickname(nickname: String) -> impl Stream<Item = Result<SocketAdd
 }
 
 pub async fn resolve_tsdns<A: net::ToSocketAddrs>(server: A, addr: &str) -> Result<SocketAddr> {
-	let mut stream = TcpStream::connect(server).await.map_err(|e| Error::Io("tsdns", e))?;
+	// The TSDNS host comes from a DNS SRV record anyone can publish, so it gets
+	// the same public-address check as the voice server itself.
+	let targets = net::lookup_host(server).await.map_err(|e| Error::Io("tsdns", e))?.collect::<Vec<_>>();
+	let Some(blocked) = targets.first().map(|a| a.ip()) else {
+		return Err(Error::TsdnsAddressNotFound);
+	};
+	let targets = targets.into_iter().filter(|a| is_allowed_target(&a.ip())).collect::<Vec<_>>();
+	if targets.is_empty() {
+		return Err(Error::BlockedTarget(blocked));
+	}
+	let mut stream =
+		TcpStream::connect(&targets[..]).await.map_err(|e| Error::Io("tsdns", e))?;
 	stream.write_all(addr.as_bytes()).await.map_err(|e| Error::Io("tsdns", e))?;
+	// A real answer is one short "ip:port" line; cap it so a hostile peer can't
+	// stream unbounded data into memory.
 	let mut data = Vec::new();
-	stream.read_to_end(&mut data).await.map_err(|e| Error::Io("tsdns", e))?;
+	(&mut stream).take(512).read_to_end(&mut data).await.map_err(|e| Error::Io("tsdns", e))?;
 
 	let addr = str::from_utf8(&data).map_err(Error::TsdnsParseResponse)?;
 	if addr.starts_with("404") {
 		return Err(Error::TsdnsAddressNotFound);
 	}
-	match parse_ip(addr)? {
-		ParseIpResult::Addr(a) => Ok(a),
-		_ => Err(Error::TsdnsAddressInvalidResponse(addr.to_string())),
+	match parse_ip(addr.trim()) {
+		Ok(ParseIpResult::Addr(a)) => Ok(a),
+		_ => Err(Error::TsdnsAddressInvalidResponse),
 	}
 }
 
@@ -489,6 +558,21 @@ fn order_srv_by_priority_weight(
 mod test {
 	use super::*;
 	use crate::tests::create_logger;
+
+	#[test]
+	fn public_addr_classification() {
+		for ip in ["1.1.1.1", "57.129.46.187", "2606:4700::1111", "::ffff:8.8.8.8", "64:ff9b::808:808"] {
+			assert!(is_public_addr(&ip.parse().unwrap()), "{ip} should be public");
+		}
+		for ip in [
+			"127.0.0.1", "10.1.2.3", "172.16.0.1", "192.168.178.108", "169.254.169.254",
+			"100.64.0.1", "0.0.0.0", "255.255.255.255", "224.0.0.1", "::1", "::",
+			"fd00::1", "fe80::1", "::ffff:127.0.0.1", "::ffff:192.168.1.1", "64:ff9b::a00:1",
+			"2002:c0a8:0101::1", "2001:db8::1",
+		] {
+			assert!(!is_public_addr(&ip.parse().unwrap()), "{ip} should be internal");
+		}
+	}
 
 	#[test]
 	fn parse_ip_without_port() {
