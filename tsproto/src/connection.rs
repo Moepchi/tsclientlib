@@ -466,6 +466,12 @@ impl Stream for Connection {
 			Poll::Pending => {}
 		}
 
+		// Pings queued by the resender and acks queued while reading leave now: nothing else
+		// wakes this task before the next packet or timer, and a ping is timed from its queuing.
+		if let Err(e) = self.poll_send_acks(cx) {
+			return Poll::Ready(Some(Err(e)));
+		}
+
 		Poll::Pending
 	}
 }
